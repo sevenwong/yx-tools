@@ -1,0 +1,29 @@
+# ---- 运行时产物（不入库）----
+.DS_Store
+logs/
+__pycache__/
+*.pyc
+result.csv
+Cloudflare.txt
+ws_prefix_state.json
+ws_run_stats.jsonl
+
+# ---- 本地配置（含 uuid，别公开）----
+.cloudflare_speedtest_config.json
+
+# ---- 备份 ----
+*.bak.*
+*.bak-*
+
+# ---- 2026-10 对照实验残留（本地留着，不入库）----
+A_t4_tl200.csv
+B_t4_full.csv
+D_5mb.csv
+E_10mb.csv
+t_t1.csv
+t_tl.csv
+cf_probe.csv
+cf_full15.txt
+sample60.txt
+five.txt
+ips_ports.txt
