@@ -8,6 +8,9 @@ Cloudflare SpeedTest 跨平台自动化脚本
 
 import os
 import sys
+import time
+import math
+import threading
 import platform
 import subprocess
 import requests
@@ -16,6 +19,31 @@ import csv
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+
+# 节点名称是否带测速值
+# False：只写地区名（并发测速的绝对值会被本机带宽压缩，写进名字是失真的）
+NAME_WITH_SPEED = False
+
+
+# ── 阶段计时（仅诊断用，不参与任何判断）────────────────────────────
+# 整轮 779 秒此前完全没有分段数据，只能靠两轮实测相减去猜，结果把瓶颈
+# 归到了 colo 探测上（实测只占 6 秒）。打点后每段真实占比直接可见。
+_STAGE_T0 = time.time()
+_STAGE_LAST = [_STAGE_T0]
+
+
+def stage_timer(label):
+    """打印"距启动累计耗时 / 距上一个打点耗时"，用于定位耗时瓶颈"""
+    now = time.time()
+    print(f"⏱️  [stage] {label:<26} 累计 {now - _STAGE_T0:7.1f}s   本段 {now - _STAGE_LAST[0]:7.1f}s")
+    _STAGE_LAST[0] = now
+
+
+def build_node_name(region_name, speed):
+    if NAME_WITH_SPEED:
+        return f"{region_name}-{speed:.2f}MB/s"
+    return f"{region_name}"
 
 
 # 使用curl的备用HTTP请求函数（解决SSL模块不可用的问题）
@@ -225,6 +253,44 @@ AIRPORT_CODES = {
 AIRPORT_CODES_URL = "https://raw.githubusercontent.com/cloudflare/cf-ui/master/packages/colo-config/src/data.json"
 AIRPORT_CODES_FILE = "airport_codes.json"
 
+# 上报前的IP 可用性验证（WS 握手）
+# 用实际使用的 Worker 域名和 WS 路径做握手，期望返回 101。
+# 背景：Cloudflare 边缘对部分 IP 段访问第三方 Worker 域名会返回 "error code: 1034"，
+# 此时测速仍能测出高速度（因为测的是 speed.cloudflare.com 自家CDN），但节点不可用。
+WORKER_VERIFY_DOMAIN = "by.linkup6.xyz"
+WORKER_VERIFY_PATH = "/?ed=2048"
+
+# Cloudflare 网段级 WS 可用性白名单（实测结论，非官方文档）
+#
+# 数据来源：CloudflareST -dd 延迟测速采到 1169 个真实可用 IP（覆盖 20 个 /16 段），
+#   每段抽 6 个做 WS 握手（--noproxy '*'），2026-10-18 实测 108 个样本：
+#
+#   ✅ 100% 可用（42/42）
+#      104.16 104.17 104.18 104.19 104.20 104.21 104.24 104.25 104.27
+#      172.66  172.67
+#   ⚠️ 大部分可用（偶发 403，段内不一致，建议不放进白名单）
+#      141.101 4/5    188.114 4/4    190.93 3/3    172.64 5/6
+#   ❌ 全部被拒（0/16）
+#      108.162 0/5    162.159 0/5    198.41 0/3    172.65 0/2
+#   ❓ 样本不足
+#      103.31 (1个可用)   173.245 (1/3)
+#
+# 现象要点：
+#   1. 被拒 IP 访问 cloudflare.com / speed.cloudflare.com 都正常（301/200），
+#      **只有访问 Worker 域名才403 + "error code: 1034"**，Worker 代码未执行。
+#   2. 同一段内也可能不一致（172.64 有1/6 被拒，173.245 有1/3 可用），
+#      所以段级白名单只是优化，**不能替代上传前的逐个握手验证**。
+#   3. 000 = 该 IP 未分配（连不上），与 403 被拦是两回事，统计时必须分开。
+#
+# 至于 Cloudflare 内部按什么标准划分这些段：**无公开资料，未验证，不做推测。**
+# 白名单是实测归纳，可能随 CF 策略变化失效。
+# 白名单清空时 build_ws_verified_ip_list() 返回 False，自动退回全量模式 + 逐个验证。
+WS_OK_CIDR_PREFIXES = [
+    "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.",
+    "104.24.", "104.25.", "104.27.",
+    "172.66.", "172.67.",
+]
+
 # Cloudflare IP列表URL和文件
 CLOUDFLARE_IP_URL = "https://www.cloudflare.com/ips-v4/"
 CLOUDFLARE_IP_FILE = "Cloudflare.txt"
@@ -232,7 +298,9 @@ CLOUDFLARE_IPV6_URL = "https://www.cloudflare.com/ips-v6/"
 CLOUDFLARE_IPV6_FILE = "Cloudflare_ipv6.txt"
 
 # 默认测速URL
-DEFAULT_SPEEDTEST_URL = "https://speed.cloudflare.com/__down?bytes=99999999"
+# 注意：speed.cloudflare.com/__down 对 bytes >= 10,000,000 直接返回 429（响应体 1 字节），
+# 会导致下载测速全部 0.00 MB/s、被 -sl 门槛全过滤。这里用 9,999,999 贴着上限，实测 200。
+DEFAULT_SPEEDTEST_URL = "https://speed.cloudflare.com/__down?bytes=9999999"
 
 # Cloudflare IPv6 地址段（内置）
 # 数据来源：https://www.cloudflare.com/ips-v6/
@@ -712,11 +780,21 @@ def download_cloudflare_ips(ip_version="ipv4", ip_file=CLOUDFLARE_IP_FILE):
         ip_version: IP版本 ("ipv4" 或 "ipv6")
         ip_file: IP文件路径
     """
+    # 2026-10-18: 优先使用 WS 可用网段生成候选池。
+    # 全量 CF 网段只有约 13% 能连上 Worker（error 1034），直接测速会浪费时间并污染排名。
+    # 生成失败则退回原有逻辑（下载全量列表），上传前仍会逐个握手验证作为兜底。
+    if ip_version != "ipv6" and WS_OK_CIDR_PREFIXES:
+        try:
+            if build_ws_verified_ip_list():
+                return True
+        except Exception as e:
+            print(f"⚠️  生成 WS 可用候选池异常，将使用全量 IP 列表: {e}")
+
     # 检查文件是否已存在
     if os.path.exists(ip_file):
         print(f"✅ 使用已有IP文件: {ip_file}")
         return True
-    
+
     if ip_version == "ipv6":
         # IPv6 使用内置地址段生成
         print("正在生成 Cloudflare IPv6 地址列表...")
@@ -1741,6 +1819,11 @@ def parse_args():
                        help='延迟上限 ms（默认: 1000）')
     parser.add_argument('--thread', type=int, default=200,
                        help='延迟测速线程数；越多延迟测速越快，性能弱的设备(如路由器)请勿太高（默认: 200, 最多: 1000）')
+    parser.add_argument('--top', type=int, default=0,
+                       help='候选池按 TCP 建连延迟排序后，只保留最快的 N 个进入下载测速（0=不截断，默认: 0）')
+    parser.add_argument('--max-rtt', type=float, default=0,
+                       help='RTT 硬门槛（毫秒）：TCP 建连耗时超过该值的 IP 直接淘汰，'
+                            '用于切掉新加坡等远端边缘（0=不限制，默认: 0）')
     
     # 常规测速模式参数
     parser.add_argument('--region', type=str,
@@ -1779,6 +1862,10 @@ def parse_args():
 
 def run_with_args(args):
     """使用命令行参数运行"""
+    # 候选池截断数量（--top），由 build_ws_verified_ip_list 读取
+    global POOL_TOP_N, POOL_MAX_RTT
+    POOL_TOP_N = max(0, getattr(args, 'top', 0) or 0)
+    POOL_MAX_RTT = max(0.0, getattr(args, 'max_rtt', 0) or 0.0)
     # 设置控制台编码（Windows 兼容）
     if sys.platform == "win32":
         try:
@@ -1788,6 +1875,7 @@ def run_with_args(args):
         except:
             pass
     
+    stage_timer("启动")
     print("=" * 80)
     print(" Cloudflare SpeedTest 跨平台自动化脚本（命令行模式）")
     print("=" * 80)
@@ -1805,6 +1893,7 @@ def run_with_args(args):
     # 下载 CloudflareSpeedTest
     print(f"\n[程序准备]")
     exec_name = download_cloudflare_speedtest(os_type, arch_type)
+    stage_timer("程序准备")
     
     # 选择 IP 版本
     if args.ipv6:
@@ -1818,6 +1907,7 @@ def run_with_args(args):
     if not download_cloudflare_ips(ip_version, ip_file):
         print("❌ 准备IP列表失败")
         return 1
+    stage_timer("候选池生成(WS状态+RTT+top截断)")
     
     # 根据模式运行
     if args.mode == 'beginner':
@@ -1852,7 +1942,9 @@ def run_with_args(args):
         print(f"\n运行命令: {' '.join(cmd)}")
         print("=" * 50)
         
+        stage_timer("进入二进制测速(延迟扫描+下载测速)")
         result = subprocess.run(cmd, encoding='utf-8', errors='replace')
+        stage_timer("二进制测速完成")
         
         if result.returncode == 0:
             print("\n✅ 测速完成！结果已保存到 result.csv")
@@ -3053,7 +3145,7 @@ def upload_to_cloudflare_api(result_file="result.csv"):
             # 构建节点名称：地区名-速度MB/s
             region_name = ip_info.get('region_name', '未知地区')
             speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
+            name = build_node_name(region_name, speed)
             
             batch_data.append({
                 "ip": ip_info['ip'],
@@ -3391,7 +3483,7 @@ def upload_to_github(result_file="result.csv"):
             # 构建节点名称：地区名-速度MB/s（和Cloudflare Workers API一样）
             region_name = ip_info.get('region_name', '未知地区')
             speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
+            name = build_node_name(region_name, speed)
             # 格式：IP:端口#地区名-速度MB/s（井号前后无空格）
             content_lines.append(f"{ip_info['ip']}:{ip_info['port']}#{name}")
         
@@ -3580,7 +3672,616 @@ def upload_to_github(result_file="result.csv"):
         return None
 
 
-def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, uuid=None, upload_count=10, clear_existing=False):
+# ============================================================================
+# WS 白名单自愈状态 + 采样预算反向推算
+# ----------------------------------------------------------------------------
+# 背景：WS_OK_CIDR_PREFIXES 只是某次实测的快照，Cloudflare 的拦截策略会漂移，
+# 写死的白名单会静默过期。这里把每次上传前 WS 握手的真实结果回写到 /16 粒度：
+#   - 连续 3 次失败 → 该 /16 熔断 7 天（到期后自动以最低权重重新参与采样复测）
+#   - 采样预算按历史转化率反推（目标数 / 转化率 × 1.5），不再写死 1500
+# ============================================================================
+WS_STATE_FILE = "ws_prefix_state.json"
+WS_RUN_STATS_FILE = "ws_run_stats.jsonl"
+WS_COOLDOWN_DAYS = 7
+WS_FAIL_STREAK_LIMIT = 3
+
+# 本次运行候选池的统计，供上报阶段写进 run stats
+_POOL_STATS = {"sampled": 0, "alive": 0}
+
+
+def _ws_prefix_key(ip):
+    """104.16.134.105 -> '104.16'"""
+    return ".".join(str(ip).split(".")[:2])
+
+
+def _load_ws_state():
+    try:
+        with open(WS_STATE_FILE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("version", 1)
+    st.setdefault("prefixes", {})
+    return st
+
+
+def _save_ws_state(st):
+    st["updated"] = datetime.now().isoformat(timespec="seconds")
+    tmp = WS_STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WS_STATE_FILE)
+    except Exception as e:
+        print(f"⚠️  写入白名单状态失败: {e}")
+
+
+_WS_STATE_LOCK = threading.Lock()
+
+
+def record_ws_verify_result(ip, ok):
+    """把一次 WS 握手验证结果记到对应 /16 上，失败可触发熔断
+
+    并发验证时多个线程会同时读改写同一份 JSON，不加锁会互相覆盖，
+    导致 ok/fail 计数少记（只影响历史评分，不影响本次选出的 IP）。
+    """
+    key = _ws_prefix_key(ip)
+    if key + "." not in WS_OK_CIDR_PREFIXES:
+        return  # 不在白名单内的段不参与评分
+    with _WS_STATE_LOCK:
+        st = _load_ws_state()
+        rec = st["prefixes"].setdefault(key, {"ok": 0, "fail": 0, "streak": 0})
+        now = time.time()
+        if ok:
+            rec["ok"] = rec.get("ok", 0) + 1
+            rec["streak"] = 0
+            rec["last_ok"] = int(now)
+            rec.pop("cool_until", None)
+        else:
+            rec["fail"] = rec.get("fail", 0) + 1
+            rec["streak"] = rec.get("streak", 0) + 1
+            rec["last_fail"] = int(now)
+            if rec["streak"] >= WS_FAIL_STREAK_LIMIT:
+                rec["cool_until"] = int(now + WS_COOLDOWN_DAYS * 86400)
+                print(f"🧊 {key}.x 连续 {rec['streak']} 次 WS 握手失败，熔断 {WS_COOLDOWN_DAYS} 天")
+        _save_ws_state(st)
+
+
+def _ws_prefix_weight(rec):
+    """评分 = 0.2 底座 + 历史成功率，保证没熔断的段仍会被少量采样"""
+    ok = rec.get("ok", 0)
+    fail = rec.get("fail", 0)
+    total = ok + fail
+    rate = (ok / total) if total else 0.5
+    return 0.2 + rate
+
+
+def active_ws_prefixes():
+    """当前可采样的 [(prefix, weight)]，已熔断的段被剔除"""
+    st = _load_ws_state()
+    now = time.time()
+    out = []
+    for p in WS_OK_CIDR_PREFIXES:
+        key = p.rstrip(".")
+        rec = st["prefixes"].get(key, {})
+        cu = rec.get("cool_until")
+        if cu and cu > now:
+            continue
+        out.append((key, _ws_prefix_weight(rec)))
+    if not out:  # 全被熔断时不要把候选池搞空，退回全白名单等权
+        out = [(p.rstrip("."), 1.0) for p in WS_OK_CIDR_PREFIXES]
+    return out
+
+
+def _ws_history_conversion(sample_n=20):
+    """历史转化率中位数：通过 WS 验证的 IP 数 / 采样数"""
+    vals = []
+    try:
+        with open(WS_RUN_STATS_FILE, "r", encoding="utf-8") as f:
+            for line in f.readlines()[-sample_n:]:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                s = rec.get("sampled") or 0
+                v = rec.get("verified_ok") or 0
+                if s > 0:
+                    vals.append(v / s)
+    except Exception:
+        return None
+    if not vals:
+        return None
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
+def target_sample_size(target_uploads=10, default=1500):
+    """采样预算 = 目标数 / 历史转化率 × 1.5，限制在 1200~6000"""
+    conv = _ws_history_conversion()
+    if not conv or conv <= 0:
+        return default
+    budget = int(math.ceil(target_uploads * 1.5 / conv))
+    return max(1200, min(6000, budget))
+
+
+def record_run_stats(**kw):
+    """追加一行运行统计，供下次反推预算"""
+    rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "sampled": _POOL_STATS.get("sampled", 0),
+        "alive": _POOL_STATS.get("alive", 0),
+    }
+    rec.update(kw)
+    try:
+        with open(WS_RUN_STATS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def select_diverse_ips(ip_infos, count, per_24=2):
+    """同一 /24 最多取 per_24 个，避免整批 IP 压在同一段位上一起失效
+
+    第一轮按配额挑，挑不满再放宽配额补足（宁可用满名额，也不留空位）。
+    """
+    picked, seen, rest = [], {}, []
+    for info in ip_infos:
+        key = ".".join(str(info["ip"]).split(".")[:3])
+        if seen.get(key, 0) >= per_24:
+            rest.append(info)
+            continue
+        picked.append(info)
+        seen[key] = seen.get(key, 0) + 1
+        if len(picked) >= count:
+            return picked
+    for info in rest:
+        if len(picked) >= count:
+            break
+        picked.append(info)
+    return picked
+
+
+def select_by_colo(ip_infos, count, per_colo=2):
+    """同一个 colo（Cloudflare 机房）最多取 per_colo 个
+
+    为什么不能只按 TTFB 排序取前 N：TTFB 最优的那批几乎全落在一个机房
+    （实测全是 LAX），一旦该机房故障或路由劣化，10 个 IP 同时失效。
+    实测本机可达 5 个 colo（LAX/AMS/LHR/FRA/CDG），TTFB 中位数差不到 150ms，
+    混用几乎不损失速度，所以按机房配额分摊。
+    挑不满时逐轮把上限 +1 放宽，实在凑不够才退回不限。
+    """
+    if not ip_infos:
+        return []
+    if not any(info.get('colo') for info in ip_infos):
+        # colo 全部探测失败：退回只做 /24 去重
+        return select_diverse_ips(ip_infos, count, per_24=2)
+
+    for limit in range(max(1, per_colo), count + 1):
+        picked, seen = [], {}
+        for info in ip_infos:
+            key = info.get('colo') or 'unknown'
+            if seen.get(key, 0) >= limit:
+                continue
+            picked.append(info)
+            seen[key] = seen.get(key, 0) + 1
+            if len(picked) >= count:
+                # 再叠一层 /24 去重，避免同段扎堆
+                return select_diverse_ips(picked, count, per_24=2)
+    return select_diverse_ips(picked, count, per_24=2)
+
+
+# 候选池截断数量（0 = 不截断）。由 run_with_args 从 --top 赋值。
+POOL_TOP_N = 0
+# RTT 硬门槛（毫秒）：>0 时只保留 TCP 建连耗时不超过该值的 IP。
+# 用途：CF 优选池里混着远端边缘（如新加坡 104.18.3x/4x，从北美测约 180ms），
+# 按下载速度排序会把它们选出来，但端到端延迟比本地边缘高 300ms 左右，
+# 握手和 TCP 慢启动被拖慢，日常上网反而更差。0 表示不限制。
+POOL_MAX_RTT = 0.0
+# 最近一次 measure_tcp_rtt 的结果 {ip: rtt_ms}，供 fast_select 等外部复用
+POOL_RTT_MAP = {}
+
+# 本地 colo 段：实测 104.16~104.19 从本机进来全部落 LAX；
+# 104.20/21/24/25/27 与 172.66/67 落 AMS/LHR/FRA/CDG（少量 LAX）。
+# 截断候选池时按这两组各占一半名额，否则纯按 RTT 排序会把远端 colo 全挤掉，
+# 最终 10 个 IP 全在一个机房，该机房故障即全灭。
+_SEG_GROUP_LOCAL = {"104.16", "104.17", "104.18", "104.19"}
+
+
+def _seg_group(ip):
+    return "local" if ip.rsplit(".", 2)[0] in _SEG_GROUP_LOCAL else "remote"
+
+
+def _quota_by_seg(ranked, top_n, local_ratio=0.5):
+    """按地区组配额截断候选池，某组不足时由另一组补齐
+
+    ranked: [(ip, rtt_ms), ...] 已按 RTT 升序
+    """
+    local_quota = int(round(top_n * local_ratio))
+    local = [x for x in ranked if _seg_group(x[0]) == "local"]
+    remote = [x for x in ranked if _seg_group(x[0]) != "local"]
+    picked = local[:local_quota] + remote[:top_n - local_quota]
+    if len(picked) < top_n:
+        used = {ip for ip, _ in picked}
+        for item in ranked:
+            if len(picked) >= top_n:
+                break
+            if item[0] not in used:
+                picked.append(item)
+                used.add(item[0])
+    picked.sort(key=lambda x: x[1])
+    return picked
+
+
+def build_ws_verified_ip_list(max_per_seg=None):
+    """生成只含 WS 可用网段的 Cloudflare IP 列表，写入 CLOUDFLARE_IP_FILE
+
+    为什么要预筛：Cloudflare 全量 IPv4 网段中只有约 13% 能连上你的 Worker（error 1034），
+    而 CloudflareST 测速是逐个 IP 跑握手+下载，喂给它必然被拒的 IP 会：
+      1) 大幅拖慢测速（--thread 500 也压不住）
+      2) 排名靠前的"高速IP"全是不可用的，污染最终结果
+
+    这里直接把候选池限制在实测可用段（104.16/104.24）内，再叠加上传前的
+    逐个握手验证作为第二道保险。
+
+    失败时返回 False，此时调用方应退回"不过滤、只靠上传前验证"的保守模式。
+    """
+    import ipaddress
+    import random
+    import re
+    import subprocess
+
+    if not WS_OK_CIDR_PREFIXES:
+        return False
+
+    # 取官方发布的真实网段，再筛出白名单前缀对应的块。
+    # 不随机造 IP：Cloudflare 段内并非所有地址都已分配，随机造会得到大量
+    # 连接失败(curl 返回 000)的空地址，白白占用候选位。
+    try:
+        # 用 curl 而非 urllib：urllib 的 TLS 栈在部分网络环境下会握手失败
+        proc = subprocess.run(
+            ['/usr/bin/curl', '-s', '--connect-timeout', '10', '--max-time', '20',
+             CLOUDFLARE_IP_URL],
+            capture_output=True, text=True, timeout=30
+        )
+        all_cidrs = re.findall(r'\d+\.\d+\.\d+\.\d+/\d+', proc.stdout or '')
+        if not all_cidrs:
+            print("⚠️  未能解析到 Cloudflare 官方网段")
+            return False
+    except Exception as e:
+        print(f"⚠️  获取 Cloudflare 官方网段失败: {e}")
+        return False
+
+    # 保留与白名单前缀相交的官方网段。
+    # 注意：不能只看网段起点是否匹配—— 官方 172.64.0.0/13 覆盖 172.64~172.71，
+    # 起点 "172.64." 不在白名单里，但块内的 172.66/172.67 是可用的。
+    # 所以只要网段与任一白名单前缀**有交集**就整块保留，采样时再逐个地址过滤。
+    kept_blocks = []
+    for cidr in all_cidrs:
+        net = ipaddress.ip_network(cidr, strict=False)
+        if any(net.overlaps(ipaddress.ip_network(p + '0.0/16')) for p in WS_OK_CIDR_PREFIXES):
+            kept_blocks.append(net)
+
+    if not kept_blocks:
+        print("⚠️  官方网段中未匹配到白名单前缀")
+        return False
+
+    # 采样：按 /16 配额分配，直接在白名单段内撒点。
+    # 旧做法是在整块（/13、/14）里均匀撒再逐地址过滤，可三块 20 个 /16 里只有 11 个
+    # 落在白名单，41.5% 的点被白白丢掉；按配额撒同样的预算能多拿约 40% 的有效候选。
+    random.seed()
+    if not max_per_seg:
+        max_per_seg = target_sample_size()
+
+    pairs = []
+    for key, weight in active_ws_prefixes():
+        pnet = ipaddress.ip_network(key + '.0.0/16')
+        if any(pnet.subnet_of(b) for b in kept_blocks):
+            pairs.append((key, weight))
+
+    if not pairs:
+        print("⚠️  白名单段与官方网段无交集")
+        return False
+
+    total_w = sum(w for _, w in pairs)
+    ips = []
+    for key, weight in pairs:
+        quota = max(1, int(round(max_per_seg * weight / total_w)))
+        base = int(ipaddress.ip_address(key + '.0.0'))
+        for _ in range(quota):
+            # 跳过 .0.0（网络号）和 .255.255（广播地址）
+            ips.append(str(ipaddress.ip_address(base + random.randrange(1, 65535))))
+
+    ips = list(dict.fromkeys(ips))
+    if not ips:
+        return False
+    print(f"   采样预算: {max_per_seg} 个（{len(pairs)} 个 /16 按 WS 评分分配，实际撒点 {len(ips)}）")
+
+    # TCP 探活：Cloudflare 段内并非所有地址都已分配，随机采样会命中大量空地址
+    # （实测 172.66/172.67 只有 30~50% 可连，104.20 只有 20%）。
+    # 不探活的话 CloudflareST 会把这些连不上的全部跳过，最终 "可用: 0"，
+    # 看起来像线程不够/崩溃，实际是候选池无效。
+    sampled_count = len(ips)
+    alive = probe_tcp_alive(ips, port=443, timeout=3, workers=64)
+    if not alive:
+        print("⚠️  TCP 探活后无可用 IP，返回 False（退回全量模式）")
+        return False
+
+    ips = alive
+    # 按建连延迟排序后截断（--top N）：下载测速是串行、单 IP 约 10 秒，
+    # 把整个候选池都测一遍会把周任务拖到 1.5 小时；而实测低延迟那批的达标率
+    # （约 55%）远高于全池（约 6%），砍掉高延迟尾巴对结果几乎无损。
+    if (POOL_TOP_N or POOL_MAX_RTT > 0) and ips:
+        ranked = measure_tcp_rtt(ips, port=443, timeout=2, workers=200)
+        POOL_RTT_MAP.clear()
+        POOL_RTT_MAP.update(ranked)
+        # RTT 硬门槛：先切掉远端边缘（新加坡等），再按延迟排序截断。
+        # 远端边缘带宽往往更大，纯按速度选会优先命中它们，但端到端高 300ms。
+        if POOL_MAX_RTT > 0 and ranked:
+            before = len(ranked)
+            passed = [(ip, r) for ip, r in ranked if r <= POOL_MAX_RTT]
+            if passed:
+                print(f"   RTT 门槛 {POOL_MAX_RTT:.0f}ms: {before} -> {len(passed)} 个"
+                      f"（{passed[0][1]:.0f}~{passed[-1][1]:.0f} ms）")
+                ranked = passed
+            else:
+                print(f"⚠️  RTT 门槛 {POOL_MAX_RTT:.0f}ms 过滤后为空"
+                      f"（最快也有 {ranked[0][1]:.0f}ms），忽略门槛")
+        if not ranked:
+            print("⚠️  延迟排序全部失败，保留原候选池")
+        elif POOL_TOP_N and len(ranked) > POOL_TOP_N:
+            picked = _quota_by_seg(ranked, POOL_TOP_N)
+            n_local = sum(1 for ip, _ in picked if _seg_group(ip) == "local")
+            print(f"   延迟排序: 保留 {len(picked)} 个"
+                  f"（{picked[0][1]:.0f}~{picked[-1][1]:.0f} ms，"
+                  f"美西段 {n_local} 个 / 欧洲等其他段 {len(picked) - n_local} 个），"
+                  f"其余 {len(ranked) - len(picked)} 个不进入下载测速")
+            ips = [ip for ip, _ in picked]
+        else:
+            if POOL_TOP_N:
+                print(f"⚠️  延迟排序只测通 {len(ranked)} 个（少于 --top {POOL_TOP_N}），按实测结果全部保留")
+            ips = [ip for ip, _ in ranked]
+    _POOL_STATS.update(sampled=sampled_count, alive=len(alive))
+    try:
+        with open(CLOUDFLARE_IP_FILE, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(ips) + '\n')
+        print(f"✅ 已生成 WS 可用候选池: {len(ips)} 个 IP（已通过 TCP 探活）")
+        print(f"   来源: {' '.join(str(n) for n in kept_blocks)}")
+        return True
+    except Exception as e:
+        print(f"⚠️  写入候选 IP 列表失败: {e}")
+        return False
+
+
+def measure_tcp_rtt(ips, port=443, timeout=2, workers=200):
+    """并发测量每个 IP 的 TCP 建连耗时，返回 [(ip, rtt_ms), ...] 按延迟升序
+
+    用途：给 --top 做截断排序。这里只关心"能不能连、连得多快"，
+    不做 TLS/HTTP 握手，所以单次成本就是一次 TCP 三次握手。
+    连不上的直接丢弃（这些 IP 送进下载测速也只会耗满超时窗口）。
+    """
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(ip):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        try:
+            sock.connect((ip, port))
+            return ip, (time.perf_counter() - t0) * 1000
+        except OSError:
+            return ip, None
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    if not ips:
+        return []
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ips)))) as pool:
+        results = list(pool.map(_one, ips))
+
+    ranked = [(ip, rtt) for ip, rtt in results if rtt is not None]
+    ranked.sort(key=lambda x: x[1])
+    return ranked
+
+
+def probe_tcp_alive(ips, port=443, timeout=3, workers=64):
+    """并发探测 IP 的 TCP 端口是否可达，返回存活列表
+
+    Cloudflare 的网段内并非所有地址都已分配，随机采样会大量命中空地址
+    （实测 172.66/172.67 仅 30~50% 可连，104.20 仅 20%）。
+    这些地址会让 CloudflareST 反复超时，拖慢甚至拖垮测速。
+
+    用 xargs -P 并发跑 nc，避免 Python 逐个 socket 探测太慢。
+    """
+    import subprocess
+    import tempfile
+
+    if not ips:
+        return []
+
+    with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
+        f.write('\n'.join(ips) + '\n')
+        listfile = f.name
+
+    try:
+        # 不用 sh -c 套一层（嵌套引号容易被转义破坏导致静默无输出），
+        # 直接把 ip 作为 $1 传给内层 sh。
+        cmd = (
+            f'xargs -P {workers} -n1 /bin/sh -c '
+            f'\'nc -z -G {timeout} "$1" {port} 2>/dev/null && echo "$1"\' _ < {listfile}'
+        )
+        proc = subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=len(ips) * timeout + 60)
+        alive = [ln.strip() for ln in proc.stdout.splitlines()
+                 if ln.strip() and not ln.startswith('/')]
+    except Exception as e:
+        print(f"⚠️  TCP 探活失败: {e}")
+        return list(ips)
+    finally:
+        try:
+            os.unlink(listfile)
+        except OSError:
+            pass
+
+    total = len(ips)
+    got = len(alive)
+    if got < total:
+        print(f"   TCP 探活: {got}/{total} 个地址可用（其余为未分配地址）")
+    return alive
+
+
+def verify_ip_usable(ip, port=443, timeout=8):
+    """验证某个优选 IP 是否真能用作代理（WS 握手能否成功）
+
+    Cloudflare 优选 IP 有个陷阱：测速脚本测的是 speed.cloudflare.com（CF 自家域名）
+    的下载速度，任何 CF IP 都能测出高速；但真正要连的是 worker 域名，
+    Cloudflare 边缘节点会对部分 IP 段返回 "error code: 1034" 拒绝服务。
+
+    1034 的含义：Cloudflare 边缘拦截了对其它客户域名的访问，属于默认安全策略，
+    请求根本没到 Worker 代码。所以换协议（xhttp）也没用，拦截在 HTTP 层之前。
+
+    实测表现（2026-10-18）：
+      - 173.245.58.83（测速31MB/s，排第一）→ 403 + error code: 1034
+      - 104.17.8.140（测速 24MB/s）→ 101 Switching Protocols ✅
+
+    这里用真实 WS 握手验证，期望返回 101。其它状态码都视为不可用。
+    关键：必须加 --noproxy '*' 绕过系统代理，否则测的是代理出口而非该 IP 本身。
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                '/usr/bin/curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                '--noproxy', '*', '--http1.1',
+                '--resolve', f'{WORKER_VERIFY_DOMAIN}:{port}:{ip}',
+                '-H', f'Host: {WORKER_VERIFY_DOMAIN}',
+                '-H', 'Upgrade: websocket',
+                '-H', 'Connection: Upgrade',
+                '-H', 'Sec-WebSocket-Version: 13',
+                '-H', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+                '--connect-timeout', str(timeout), '--max-time', str(timeout + 2),
+                f'https://{WORKER_VERIFY_DOMAIN}{WORKER_VERIFY_PATH}',
+            ],
+            capture_output=True, text=True, timeout=timeout + 4
+        )
+        ok = result.stdout.strip() == '101'
+        record_ws_verify_result(ip, ok)
+        return ok
+    except Exception:
+        record_ws_verify_result(ip, False)
+        return False
+
+
+def measure_worker_ttfb(ip, port=443, uuid="node", timeout=8, rounds=2):
+    """测量该 IP 到 Worker 的真实首字节时间（毫秒），多轮取最小值；失败返回 None
+
+    为什么不能只看 TCP RTT：TCP 建连只覆盖第一段网络，TLS 握手（2 个往返）
+    和边缘回源的耗时它完全看不到。实测存在 TCP 建连 84ms、完整请求却要 1100ms
+    的 IP（新加坡 104.18.36.99），按 RTT 排序会把它排到第一位。
+    TTFB 把建连 + 加密 + 请求 + Worker 响应全算进去，和用户实际感受到的首屏
+    等待最接近，所以用来做上传前的最后一轮排序。
+    """
+    import subprocess
+    best = None
+    url = f"https://{WORKER_VERIFY_DOMAIN}/{uuid}/api/preferred-ips"
+    for _ in range(max(1, rounds)):
+        try:
+            r = subprocess.run(
+                [
+                    '/usr/bin/curl', '-s', '-o', '/dev/null',
+                    '-w', '%{time_starttransfer}', '--noproxy', '*',
+                    '--resolve', f'{WORKER_VERIFY_DOMAIN}:{port}:{ip}',
+                    '--connect-timeout', str(timeout),
+                    '--max-time', str(timeout + 2),
+                    url,
+                ],
+                capture_output=True, text=True, timeout=timeout + 4
+            )
+            v = float(r.stdout.strip() or 0) * 1000
+            if v > 0 and (best is None or v < best):
+                best = v
+        except Exception:
+            continue
+    return best
+
+
+def measure_ttfb_and_colo(ip, port=443, timeout=8, rounds=2):
+    """一次请求同时取回 TTFB（毫秒）和真实落地机房；失败返回 (None, None)
+
+    原先分两次跑：先用 Worker API 测 TTFB，再请求 /cdn-cgi/trace 查机房。
+    两次请求的 TCP 建连 + TLS 握手完全重复，等于把最贵的一段付了两遍。
+    /cdn-cgi/trace 由边缘直接返回，它的 time_starttransfer 同样包含建连、
+    握手和边缘响应，跨机房的物理距离仍是主导项，用来做排序与原来等价。
+    """
+    import subprocess
+    best_ttfb = None
+    colo = None
+    url = f"https://{WORKER_VERIFY_DOMAIN}/cdn-cgi/trace"
+    marker = '---WBSPLIT---|'
+    for _ in range(max(1, rounds)):
+        try:
+            r = subprocess.run(
+                [
+                    '/usr/bin/curl', '-s', '-w', f'\n{marker}%{{time_starttransfer}}',
+                    '--noproxy', '*',
+                    '--resolve', f'{WORKER_VERIFY_DOMAIN}:{port}:{ip}',
+                    '--connect-timeout', str(timeout),
+                    '--max-time', str(timeout + 2),
+                    url,
+                ],
+                capture_output=True, text=True, timeout=timeout + 4
+            )
+            out = r.stdout or ''
+            if marker not in out:
+                continue
+            body, _, tail = out.rpartition(marker)
+            try:
+                v = float(tail.strip() or 0) * 1000
+            except ValueError:
+                v = 0
+            if colo is None:
+                for line in body.splitlines():
+                    if line.startswith('colo='):
+                        colo = line.split('=', 1)[1].strip() or None
+                        break
+            if v > 0 and (best_ttfb is None or v < best_ttfb):
+                best_ttfb = v
+        except Exception:
+            continue
+    return best_ttfb, colo
+
+
+def measure_colo(ip, port=443, timeout=8):
+    """返回该 IP 实际落地的 Cloudflare 机房代码（LAX/AMS/LHR…），失败返回 None
+
+    为什么不能按 IP 段判断：段号和机房不对应。实测 172.66 同一段里既有 LAX
+    也有 AMS/法兰克福，104.21 会落到 AMS/LHR/FRA/CDG 四个机房。
+    只有请求 /cdn-cgi/trace 才知道真实落点。
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['/usr/bin/curl', '-s', '--noproxy', '*',
+             '--resolve', f'{WORKER_VERIFY_DOMAIN}:{port}:{ip}',
+             '--connect-timeout', str(timeout), '--max-time', str(timeout + 2),
+             f'https://{WORKER_VERIFY_DOMAIN}/cdn-cgi/trace'],
+            capture_output=True, text=True, timeout=timeout + 4
+        )
+        for line in (r.stdout or '').splitlines():
+            if line.startswith('colo='):
+                return line.split('=', 1)[1].strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, uuid=None, upload_count=10, clear_existing=False, min_usable=0):
     """命令行模式：上报优选结果到 Cloudflare Workers API
     
     Args:
@@ -3589,6 +4290,8 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
         uuid: UUID或路径
         upload_count: 上传IP数量
         clear_existing: 是否清空现有IP（默认: False）
+        min_usable: WS 握手通过数的底线（默认: 0，不设底线）。低于该值就整次
+            放弃，不清空也不上传。fast_select.py 传 5，避免 --clear 把线上池缩水。
     """
     print("\n" + "=" * 70)
     print(" 命令行模式：Cloudflare Workers API 上报")
@@ -3726,7 +4429,103 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
         # 限制上传数量
         upload_count = min(upload_count, len(best_ips))
         print(f"✅ 找到 {len(best_ips)} 个测速结果，将上传前 {upload_count} 个")
-        
+        stage_timer("上传:解析result.csv")
+
+        # 上报前验证 IP 是否真能用作代理（WS 握手验证）
+        # 测速速度高 ≠ 能当代理用：Cloudflare 边缘对部分 IP 段访问 Worker 域名
+        # 会返回 1034 拒绝，这类 IP 测速分很高但实际连不通。
+        print("\n🔬 正在验证 IP 代理可用性（WS 握手）...")
+        usable_ips = []
+        blocked_ips = []
+        # 只验证前 3 倍名额（-dn 调到 50 后逐个验证全部 50 个太慢；
+        # 排序已按速度降序，前 3 倍足够挑出 10 个可用的）
+        verify_limit = min(len(best_ips), max(upload_count * 3, 20))
+        verify_list = best_ips[:verify_limit]
+        # 并发 8：curl 收到 101 后连接升级成 WS 长连接，它不会自己断开，
+        # 只能一直挂到 --max-time（10 秒）。所以无论验证成功还是失败，单个
+        # IP 都要耗满 10 秒，串行 20 个就是 200 秒——实测 203.8/20 个。
+        # 这些请求分发到不同 anycast IP、每次只走几十字节，不占带宽，
+        # 并发不改变单个 IP 的判定结果。
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
+            verify_oks = list(_ex.map(
+                lambda x: verify_ip_usable(x['ip'], x['port']), verify_list))
+        for ip_info, ok in zip(verify_list, verify_oks):
+            if ok:
+                usable_ips.append(ip_info)
+            else:
+                blocked_ips.append(ip_info)
+
+        if blocked_ips:
+            print(f"⚠️  {len(blocked_ips)} 个 IP 被 Cloudflare 拒绝（error 1034，不能作为代理）:")
+            for ip_info in blocked_ips[:5]:
+                print(f"     - {ip_info['ip']} ({ip_info['speed']:.2f}MB/s, {ip_info['region_name']})")
+            if len(blocked_ips) > 5:
+                print(f"     ... 还有 {len(blocked_ips) - 5} 个")
+
+        if not usable_ips:
+            record_run_stats(candidates=len(best_ips), verified_ok=0)
+            print("❌ 所有 IP 均无法连接Worker，放弃本次上传（不清空现有数据）")
+            return
+        stage_timer("上传:WS握手验证")
+
+        # 通过数低于底线就整次放弃：不清空、不上传。
+        # --clear 会先清空旧池再写新的，若只剩 2 个可用，线上池就从 10 个缩成 2 个，
+        # 比"这周不更新"糟糕。min_usable=0 表示不设底线（默认，保持原行为）。
+        if min_usable and len(usable_ips) < min_usable:
+            record_run_stats(candidates=len(best_ips), verified_ok=len(usable_ips))
+            print(f"❌ 仅 {len(usable_ips)} 个 IP 通过 WS 握手，少于底线 {min_usable} 个，"
+                  f"放弃本次上传（不清空现有数据）")
+            return
+
+        # 按真实 TTFB 重排：速度排序只看吞吐，看不见 TLS 握手和回源的开销。
+        # 实测 104.18.36.99（新加坡）TCP RTT 84ms 全场最低、速度 7.29MB/s 也过线，
+        # 但 TTFB 1031~1227ms，比洛杉矶那批（613~943ms）慢一倍。纯按速度排会选中它。
+        if usable_ips:
+            probe_n = min(len(usable_ips), max(upload_count * 3, 20))
+            print(f"\n⏱️  正在测量 TTFB + 落地机房（{probe_n} 个 × 2 轮，单次请求）...")
+            import concurrent.futures as _cf
+            probe_list = usable_ips[:probe_n]
+            # 并发 16：这一步全是网络 IO 等待，不消耗本地带宽（每次只取几 KB），
+            # 提高并发只压缩排队时间。TTFB 与机房合并到同一次请求后，
+            # 每轮探测从"两次往返"变成"一次往返"。
+            with _cf.ThreadPoolExecutor(max_workers=16) as _ex:
+                probes = list(_ex.map(
+                    lambda x: measure_ttfb_and_colo(x['ip'], x['port'], rounds=2),
+                    probe_list))
+            ttfb_map = {info['ip']: p[0] for info, p in zip(probe_list, probes)}
+            colo_map = {info['ip']: p[1] for info, p in zip(probe_list, probes)}
+            ranked = []
+            for info in usable_ips:
+                t = ttfb_map.get(info['ip'])
+                info['ttfb'] = t
+                info['colo'] = colo_map.get(info['ip'])
+                # TTFB 失败的排到最后，同延迟下速度快的优先
+                ranked.append((t if t is not None else 1e9, -info['speed'], info))
+            ranked.sort(key=lambda x: (x[0], x[1]))
+            usable_ips = [x[2] for x in ranked]
+        stage_timer("上传:TTFB+机房探测")
+
+        # 故障域收敛：同一个机房最多 per_colo 个（凑不满会自动放宽），再叠 /24 去重
+        diverse_ips = select_by_colo(usable_ips, upload_count, per_colo=2)
+        colo_summary = {}
+        for info in diverse_ips:
+            c = info.get('colo') or '未探测到'
+            colo_summary[c] = colo_summary.get(c, 0) + 1
+        print(f"   机房分布: " + "、".join(f"{k}×{v}" for k, v in colo_summary.items()))
+        for info in diverse_ips:
+            t = info.get('ttfb')
+            ttfb_s = ('%.0fms' % t) if t else '失败'
+            print(f"     {info['ip']:<16}{info['speed']:6.2f} MB/s  "
+                  f"TTFB {ttfb_s:>7}  {info.get('colo') or '?':<4} {info['region_name']}")
+        record_run_stats(candidates=len(best_ips), verified_ok=len(usable_ips),
+                         diverse=len(diverse_ips))
+
+        best_ips = diverse_ips
+        upload_count = min(upload_count, len(best_ips))
+        print(f"✅ {len(usable_ips)} 个 IP 通过验证，去重后上传前 {upload_count} 个")
+        stage_timer("上传:机房分散选择")
+
         # 如果需要清空，先执行清空操作（在确认有数据可以上报之后）
         if should_clear:
             print("\n🗑️  正在清空现有数据...")
@@ -3765,7 +4564,7 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
             # 构建节点名称：地区名-速度MB/s
             region_name = ip_info.get('region_name', '未知地区')
             speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
+            name = build_node_name(region_name, speed)
             
             batch_data.append({
                 "ip": ip_info['ip'],
@@ -3833,6 +4632,7 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
             print(f"❌ 网络错误: {e}")
         except Exception as e:
             print(f"❌ 请求失败: {e}")
+        stage_timer("上传:清空+批量写入完成")
         
     except Exception as e:
         print(f"❌ 读取测速结果失败: {e}")
@@ -3938,7 +4738,7 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
             # 构建节点名称：地区名-速度MB/s（和Cloudflare Workers API一样）
             region_name = ip_info.get('region_name', '未知地区')
             speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
+            name = build_node_name(region_name, speed)
             # 格式：IP:端口#地区名-速度MB/s（井号前后无空格）
             content_lines.append(f"{ip_info['ip']}:{ip_info['port']}#{name}")
         

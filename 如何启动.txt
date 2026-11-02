@@ -1,0 +1,8 @@
+每次运行脚本前先 source venv/bin/activate
+
+主任务（定时任务跑的就是这个；手动跑想连上传一起验证，再补 --upload api --worker-domain by.linkup6.xyz --uuid node --clear）：
+python3 fast_select.py --top 200 --max-rtt 300 --conc 8 --dur 2 --serial-dur 5 --deadline 240 --serial-budget 180 --min-speed 6.0 --pick 10 --min-pick 5
+
+完整参数说明、测法原理、门槛含义、出问题先看哪里：见 docs/测速方案.md
+
+cloudflare_speedtest.py 仍保留，但只作为库被 fast_select.py 调用，不再单独跑。
